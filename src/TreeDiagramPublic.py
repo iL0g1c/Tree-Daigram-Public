@@ -50,7 +50,7 @@ class TreeDiagramPublic(commands.Bot):
         self.logger.log(20, "Connecting to discord...")
 
     async def _load_extensions(self) -> None:
-        for extension in []:
+        for extension in ("queryDatabase",):
             await self.load_extension(f"cogs.{extension}")
 
 bot = TreeDiagramPublic()
