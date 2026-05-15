@@ -12,9 +12,11 @@ from io import StringIO
 import json
 from bson.json_util import dumps as bson_dumps
 from io import BytesIO
+import aiohttp
 
 from treeDiagramPublic import TreeDiagramPublic
 from tools.paginationEmbed import PaginatedEmbed
+from tools.serverPaginatedEmbed import ServerPaginatedEmbed
 
 
 load_dotenv()
@@ -24,11 +26,15 @@ DATABASE_IP = os.getenv('DATABASE_IP')
 DATABASE_USER = os.getenv('DATABASE_USER')
 
 class EventSummaryModal(discord.ui.Modal):
-    def __init__(self, event_type: str, verbose: str, mongo_db_client):
+    def __init__(self, event_type: str, verbose: str):
         super().__init__(title=f"Details for {event_type}")
         self.event_type = event_type
         self.verbose = verbose
-        self.mongo_db_client = mongo_db_client
+
+        self.acid_val = None
+        self.a_date = None
+        self.b_date = None
+        self.raw_event_type = None
 
     acid = discord.ui.TextInput(
         label="ACID (Numeric ID)",
@@ -51,75 +57,76 @@ class EventSummaryModal(discord.ui.Modal):
         required=False
     )
 
-    async def get_filtered_user_events(
-        self,
-        collection, 
-        acid: int = None, 
-        event_type: str = "all", # Defaulted to "all" for convenience
-        after_date: datetime = None, 
-        before_date: datetime = None
-    ):
-        """
-        Retrieves, filters, and sorts events from the users collection.
-        Supports special event types like 'all' and 'on-off'.
-        """
-        pipeline = []
+    async def fetch_and_format_events(self, page: int, per_page: int) -> tuple[list, int]:
+        """Fetches a specific page of events from the Flask API and formats them."""
+        params = {
+            "page": page,
+            "per_page": per_page,
+            "acid": self.acid_val,
+            "event_type": self.raw_event_type,
+        }
+        if self.a_date:
+            params["after"] = self.a_date.isoformat()
+        if self.b_date:
+            params["before"] = self.b_date.isoformat()
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/events/filter"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return [], 0
+                data = await resp.json()
+        
+        results = data.get("results", [])
+        total_count = data.get("count", 0)
 
-        # Stage 1: Initial Match
-        doc_match = {}
-        if acid is not None:
-            doc_match["accountID"] = acid
+        event_list = []
+        for item in results:
+            event = item.get("event", {})
+            e_type = event.get("eventType")
             
-        if doc_match:
-            pipeline.append({"$match": doc_match})
-
-        # Stage 2: Unwind
-        pipeline.append({"$unwind": "$events"})
-
-        # Stage 3: Event-Level Match
-        event_match = {}
-        
-        # --- UPDATED EVENT TYPE LOGIC ---
-        if event_type and event_type.lower() != "all":
-            if event_type.lower() == "on-off":
-                # Match if the event is either online OR offline
-                event_match["events.eventType"] = {"$in": ["online", "offline"]}
+            ts_raw = event.get("timestamp", {})
+            if isinstance(ts_raw, dict) and "$date" in ts_raw:
+                date_val = ts_raw["$date"]
+                if isinstance(date_val, str):
+                    dt = datetime.fromisoformat(date_val.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.fromtimestamp(date_val / 1000.0)
             else:
-                # Exact match for any other specific string (e.g., "banned", "kicked")
-                event_match["events.eventType"] = event_type
+                dt = datetime.now()
                 
-        # Build the date query dynamically
-        if after_date or before_date:
-            event_match["events.timestamp"] = {}
-            if after_date:
-                event_match["events.timestamp"]["$gte"] = after_date
-            if before_date:
-                event_match["events.timestamp"]["$lte"] = before_date
-                
-        if event_match:
-            pipeline.append({"$match": event_match})
+            ts_str = dt.strftime('%Y-%m-%d %H:%M')
 
-        # Stage 4: Sort (Descending: Newest first)
-        pipeline.append({"$sort": {"events.timestamp": -1}})
-
-        # Stage 5: Project
-        pipeline.append({
-            "$project": {
-                "_id": 0,
-                "accountID": 1,
-                "event": "$events" # Keeps the entire event object
-            }
-        })
-
-        # Execute
-        cursor = collection.aggregate(pipeline)
-        events = await cursor.to_list(length=None)
+            if e_type == "online":
+                event_list.append(f"**Online:** {ts_str}")
+            elif e_type == "offline":
+                event_list.append(f"**Offline:** {ts_str}")
+            elif e_type == "teleporation":
+                if self.verbose == "No":
+                    event_list.append(f"**Teleporation:** {ts_str}")
+                else:
+                    event_list.append(f"**Teleporation |** **Old Pos:** ({event.get('oldLatitude')}, {event.get('oldLongitude')}) **New Pos:** ({event.get('newLatitude')},{event.get('newLongitude')}) **Dist:** {event.get('distance')}m **Time:** {ts_str}")
+            elif e_type == "aircraftChange":
+                if self.verbose == "No":
+                    event_list.append(f"**Aircraft Change:** {ts_str}")
+                else:
+                    event_list.append(f"**Aircraft Change |** **Old:** {event.get('oldAircraft')} **New:** {event.get('newAircraft')} **Time:** {ts_str}")
+            elif e_type == "callsignChange":
+                if self.verbose == "No":
+                    event_list.append(f"**Callsign Change:** {ts_str}")
+                else:
+                    event_list.append(f"**Callsign Change |** **Old:** {event.get('oldCallsign')} **New:** {event.get('newCallsign')} **Time:** {ts_str}")
         
-        return events
+        return event_list, total_count
+    
+    async def fetch_page_callback(self, page: int, per_page: int) -> list:
+        """Wrapper method used exclusively by the ServerPaginatedEmbed to grab the items list."""
+        items, _ = await self.fetch_and_format_events(page, per_page)
+        return items
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            acid_val = int(self.acid.value)
+            self.acid_val = int(self.acid.value)
         except ValueError:
             return await interaction.response.send_message(
                 "**Error:** Invalid input. Ensure ACID is a number.", 
@@ -128,13 +135,13 @@ class EventSummaryModal(discord.ui.Modal):
         
         try:
             if self.before.value != "":
-                b_date = datetime.strptime(self.before.value, "%Y-%m-%d %H:%M")
+                self.b_date = datetime.strptime(self.before.value, "%Y-%m-%d %H:%M")
             else:
-                b_date = datetime.max
+                self.b_date = None
             if self.after.value != "":
-                a_date = datetime.strptime(self.after.value, "%Y-%m-%d %H:%M")
+                self.a_date = datetime.strptime(self.after.value, "%Y-%m-%d %H:%M")
             else:
-                a_date = datetime.min
+                self.a_date = None
         except ValueError:
             return await interaction.response.send_message(
                 "**Error:** Invalid input. Ensure dates match the `YYYY-MM-DD HH:MM` format.", 
@@ -143,62 +150,38 @@ class EventSummaryModal(discord.ui.Modal):
 
         await interaction.response.defer(thinking=True)
 
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
-
         if self.event_type == "on-off":
-            raw_event_type = "on-off"
+            self.raw_event_type = "on-off"
         elif self.event_type == "tp":
-            raw_event_type = "teleporation"
+            self.raw_event_type = "teleporation"
         elif self.event_type == "callsign":
-            raw_event_type = "callsignChange"
+            self.raw_event_type = "callsignChange"
         elif self.event_type == "aircraft":
-            raw_event_type = "aircraftChange"
+            self.raw_event_type = "aircraftChange"
         elif self.event_type == "all":
-            raw_event_type = "All"
+            self.raw_event_type = "All"
             
-        results = await self.get_filtered_user_events(
-            collection=collection,
-            acid=acid_val,
-            event_type=raw_event_type,
-            after_date=a_date,
-            before_date=b_date
-        )
-        event_list = []
-        for event in results:
-            if event['event']["eventType"] == "online":
-                event_list.append(f"**Online:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "offline":
-                event_list.append(f"**Offline:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "teleporation":
-                if self.verbose == "No":
-                    event_list.append(f"**Teleporation:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                else:
-                    event_list.append(f"**Teleporation |** **Old Position:** ({event['event']['oldLatitude']}, {event['event']['oldLongitude']}) **New Position:** ({event['event']['newLatitude']},{event['event']['newLongitude']}) **Distance:** {event['event']['distance']} Meters **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "aircraftChange":
-                if self.verbose == "No":
-                    event_list.append(f"**Aircraft Change:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                else:
-                    event_list.append(f"**Aircraft Change |** **Old Aircraft:** {event['event']['oldAircraft']} **New Aircraft:** {event['event']['newAircraft']} **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-            elif event['event']["eventType"] == "callsignChange":
-                if self.verbose == "No":
-                    event_list.append(f"**Callsign Change:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                else:
-                    event_list.append(f"**Callsign Change |** **Old Callsign:** {event['event']['oldCallsign']} **New Callsign:** {event['event']['newCallsign']} **Timestamp:** {event['event']['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+        initial_items, total_items = await self.fetch_and_format_events(1, 10)
 
-        # create results embed
-        embed = PaginatedEmbed(
-            event_list,
-            title=f"Queried Events",
-            description=f"{len(event_list)} event(s)"
+        if total_items == 0:
+            return await interaction.followup.send("No events found matching your criteria.")
+
+        # 3. Initialize the Paginator passing the class method as the callback
+        embed = ServerPaginatedEmbed(
+            initial_items=initial_items,
+            total_items=total_items,
+            fetch_callback=self.fetch_page_callback,
+            title=f"Queried Events (ACID: {self.acid_val})",
+            description=f"{total_items} event(s) found.",
+            items_per_page=10
         )
         await interaction.followup.send(embed=embed.embed, view=embed)
 
 class EventSummaryView(discord.ui.View):
-    def __init__(self, mongo_db_client):
+    def __init__(self):
         super().__init__(timeout=180)
         self.event_type = None
         self.verbose = None
-        self.mongo_db_client = mongo_db_client
 
     @discord.ui.select(
         placeholder="1. Select Event Type",
@@ -235,7 +218,7 @@ class EventSummaryView(discord.ui.View):
                 ephemeral=True
             )
         
-        modal = EventSummaryModal(self.event_type, self.verbose, self.mongo_db_client)
+        modal = EventSummaryModal(self.event_type, self.verbose)
         await interaction.response.send_modal(modal)
 
 class QueryDatabase(commands.Cog):
@@ -516,11 +499,17 @@ class QueryDatabase(commands.Cog):
     )
     async def account_report(self, interaction: discord.Interaction, acid: int):
         await interaction.response.defer()
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
-        account_doc = await collection.find_one({
-            "accountID": acid
-        })
-        if not account_doc:
+        params = {
+            "acid": acid
+        }
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/users/"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return [], 0
+                data = await resp.json()
+        if not data:
             embed = discord.Embed(
                 title="Failed",
                 description=(
@@ -531,7 +520,7 @@ class QueryDatabase(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
 
-        json_text = bson_dumps(account_doc, indent=2)
+        json_text = bson_dumps(data, indent=2)
         fp = BytesIO(json_text.encode("utf-8"))
         fp.seek(0)
 
@@ -586,7 +575,7 @@ class QueryDatabase(commands.Cog):
 
     @database_query.command(name="event_summary", description="Get a summary of an event.")
     async def log_event(self, interaction: discord.Interaction):
-        view = EventSummaryView(self.mongo_db_client)
+        view = EventSummaryView()
         await interaction.response.send_message(
             "Please configure the event settings below, then click Continue:", 
             view=view,
