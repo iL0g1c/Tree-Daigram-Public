@@ -256,9 +256,7 @@ class QueryDatabase(commands.Cog):
         if (acid and pattern) or (not acid and not pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "You must either give the acid or a pattern and not both."
-                ),
+                description="You must either give the acid or a pattern and not both.",
                 color=discord.Color.red()
             )
             await interaction.response.send_message(embed=embed)
@@ -267,9 +265,7 @@ class QueryDatabase(commands.Cog):
         if pattern is not None and not self.isValidRegex(pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "Your regex is not valid. Could not compile."
-                ),
+                description="Your regex is not valid. Could not compile.",
                 color=discord.Color.red()
             )
             await interaction.response.send_message(embed=embed)
@@ -277,129 +273,73 @@ class QueryDatabase(commands.Cog):
         
         await interaction.response.defer()
 
-        if pattern is not None and not str(pattern).strip():
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title="Failed",
-                    description="Pattern cannot be empty or whitespace.",
-                    color=discord.Color.red()
+        # Define the pagination callback inside the command closure
+        async def fetch_page_callback(page: int, per_page: int) -> list:
+            params = {
+                "page": page,
+                "per_page": per_page
+            }
+            if acid: params["acid"] = acid
+            if pattern: params["pattern"] = pattern
+
+            api_url = f"http://{DATABASE_IP}:5011/api/v2/callsign-cross-check"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, params=params) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+
+            results = data.get("results", [])
+            formatted_items = []
+            for item in results:
+                formatted_items.append(
+                    f"**GeoFS ACID:** {item.get('accountID')}, "
+                    f"**Callsign Hit(s):** {', '.join(item.get('matchedDetails', []))}, "
+                    f"**Current Callsign:** {item.get('currentCallsign')}"
                 )
-            )
-            return
-                
-        # Fetch seed documents
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
+            return formatted_items
 
-        if pattern:
-            # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
-            core_pattern, flags = self.parse_regex_input(pattern)
-            regex_query = {"$regex": core_pattern}
-            
-            valid_mongo_flags = set("imxs")
-            safe_flags = "".join(f for f in flags if f in valid_mongo_flags)
-            
-            if safe_flags:
-                regex_query["$options"] = safe_flags
+        # Fetch the very first page to establish total count and initial items
+        params = {"page": 1, "per_page": 10}
+        if acid: params["acid"] = acid
+        if pattern: params["pattern"] = pattern
 
-            seed_documents = collection.find({
-                "pastCallsigns": regex_query
-            }).max_time_ms(2000)
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/callsign-cross-check"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return await interaction.followup.send("Failed to contact the database API.")
+                data = await resp.json()
 
-        if acid:
-            seed_documents = collection.find({
-                "accountID": acid
-            })
-
-        parsed_seed_documents = await seed_documents.to_list(length=None)
-
-        # Flatten & dedupe all pastCallsigns from the seed docs
-        seed_callsigns = {
-            cs.strip()
-            for doc in parsed_seed_documents
-            for cs in doc.get("pastCallsigns", [])
-            if isinstance(cs, str) and cs.strip()
-        }
-
-        seed_cs_to_acids = defaultdict(set)
-        for _doc in parsed_seed_documents:
-            _acid = _doc.get("accountID")
-            for _cs in _doc.get("pastCallsigns", []):
-                if isinstance(_cs, str):
-                    _cs2 = _cs.strip()
-                    if _cs2:
-                        seed_cs_to_acids[_cs2].add(_acid)
-
-        seed_account_ids = {
-            d.get("accountID") for d in parsed_seed_documents if d.get("accountID") is not None
-        }
-
-        if not seed_callsigns:
-            embed = discord.Embed(
-                title="No Seed Callsigns",
-                description="No non-empty past callsigns were found in the seed documents.",
-                color=discord.Color.yellow()
-            )
-            await interaction.followup.send(embed=embed)
-            return
+        total_items = data.get("count", 0)
         
-        seed_object_ids = {
-            doc.get("_id")
-            for doc in parsed_seed_documents
-            if doc.get("_id") is not None
-        }
-
-        query = {
-            "pastCallsigns": {"$in": list(seed_callsigns)}
-        }
-
-        # Exclude the seed accounts themselves
-        if seed_account_ids:
-            query["accountID"] = {"$nin": list(seed_account_ids)}
-        elif seed_object_ids:
-            # fallback if accountID isn't present
-            query["_id"] = {"$nin": list(seed_object_ids)}
-
-        
-        # find all accounts that have a past callsign of a past callsign of the seed documents.
-
-        second_generation_callsigns = collection.find(query)
-        parsed_second_generation_callsigns = await second_generation_callsigns.to_list(length=None)
-        
-        callsign_list = []
-        for doc in parsed_second_generation_callsigns:
-            past = [cs for cs in doc.get("pastCallsigns", []) if isinstance(cs, str) and cs.strip()]
-            
-            # Use seed_callsigns instead of seed_callsigns_lower
-            matched = [cs for cs in past if cs in seed_callsigns] 
-            
-            if matched:
-                matched_details = []
-                for cs in matched:
-                    # Removed .lower() from the .get() method
-                    acids = sorted(a for a in seed_cs_to_acids.get(cs, set()) if a is not None)
-                    if acids:
-                        matched_details.append(f"{cs} (seed ACID(s): {', '.join(map(str, acids))})")
-                    else:
-                        matched_details.append(cs)
-                callsign_list.append(
-                    f"**GeoFS ACID:** {doc.get('accountID')}, "
-                    f"**Callsign Hit(s):** {', '.join(matched_details)}, "
-                    f"**Current Callsign:** {doc.get('currentCallsign')}"
-                )
-        if not callsign_list:
+        if total_items == 0:
             embed = discord.Embed(
                 title="No Matches",
                 description="No accounts were found sharing non-empty past callsigns with the seed set.",
                 color=discord.Color.yellow()
             )
-            await interaction.followup.send(embed=embed)
-            return
+            return await interaction.followup.send(embed=embed)
 
-        embed = PaginatedEmbed(
-            callsign_list,
+        initial_items = []
+        for item in data.get("results", []):
+            initial_items.append(
+                f"**GeoFS ACID:** {item.get('accountID')}, "
+                f"**Callsign Hit(s):** {', '.join(item.get('matchedDetails', []))}, "
+                f"**Current Callsign:** {item.get('currentCallsign')}"
+            )
+
+        # Initialize the server paginated embed with our callback
+        embed = ServerPaginatedEmbed(
+            initial_items=initial_items,
+            total_items=total_items,
+            fetch_callback=fetch_page_callback,
             title="Callsign Hits",
-            description=f"{len(callsign_list)} Hit(s) | Accounts that share non-empty past callsigns with the seed accounts."
+            description=f"{total_items} Hit(s) | Accounts that share non-empty past callsigns with the seed accounts.",
+            items_per_page=10
         )
+        
         await interaction.followup.send(embed=embed.embed, view=embed)
 
     @database_query.command(name="query-acids", description="Search by callsign for accounts from OspreyEyesDB.")
@@ -541,33 +481,47 @@ class QueryDatabase(commands.Cog):
     )
     async def account_creation(self, interaction: discord.Interaction, acid: int):
         await interaction.response.defer()
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
-        
-        results = collection.find({"accountID": acid})
-        parsed_results = await results.to_list(length=500)
-        if parsed_results == []:
-            embed = discord.Embed(
-                title="Failed",
-                description=(
-                    "Could not find that account."
-                ),
-                color=discord.Color.red()
-            )
-            await interaction.followup.send(embed=embed)
-            return
-        
-        user_doc = parsed_results[0]
-        events = user_doc.get("events", [])
-        if not events:
+
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/events/earliest"
+        params = {"acid": acid}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status == 404:
+                    embed = discord.Embed(
+                        title="No Events",
+                        description="No events recorded for this account, or the account doesn't exist.",
+                        color=discord.Color.yellow()
+                    )
+                    return await interaction.followup.send(embed=embed)
+                elif resp.status != 200:
+                    embed = discord.Embed(
+                        title="Failed",
+                        description="Failed to contact the database API.",
+                        color=discord.Color.red()
+                    )
+                    return await interaction.followup.send(embed=embed)
+                
+                data = await resp.json()
+
+        event = data.get("event", {})
+        if not event:
             return await interaction.followup.send("No events recorded for this account.")
-        earliest_event = events[0]
-        for event in parsed_results[0]["events"]:
-            if event["timestamp"] < earliest_event["timestamp"]:
-                earliest_event = event
+
+        ts_raw = event.get("timestamp", {})
+        if isinstance(ts_raw, dict) and "$date" in ts_raw:
+            date_val = ts_raw["$date"]
+            if isinstance(date_val, str):
+                dt = datetime.fromisoformat(date_val.replace("Z", "+00:00"))
+            else:
+                dt = datetime.fromtimestamp(date_val / 1000.0)
+            ts_str = dt.strftime('%Y-%m-%d %H:%M UTC')
+        else:
+            ts_str = str(ts_raw)  # Fallback just in case
 
         report_embed = discord.Embed(
-            title=f"Earliest detection",
-            description=f"The earliest event was a {earliest_event['eventType']} at {earliest_event['timestamp']} UTC",
+            title="Earliest Detection",
+            description=f"The earliest event was a **{event.get('eventType')}** at **{ts_str}**",
             color=discord.Color.blue()
         )
 
