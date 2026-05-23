@@ -3,8 +3,6 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import os
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.collation import Collation
 from collections import defaultdict
 from datetime import datetime
 import re
@@ -15,7 +13,6 @@ from io import BytesIO
 import aiohttp
 
 from treeDiagramPublic import TreeDiagramPublic
-from tools.paginationEmbed import PaginatedEmbed
 from tools.serverPaginatedEmbed import ServerPaginatedEmbed
 
 
@@ -224,8 +221,6 @@ class EventSummaryView(discord.ui.View):
 class QueryDatabase(commands.Cog):
     def __init__(self):
         super().__init__()
-        mongodbURI = f"mongodb://{DATABASE_USER}:{DATABASE_TOKEN}@{DATABASE_IP}:27017/?directConnection=true&serverSelectionTimeoutMS=2000&authSource={DATABASE_NAME}"
-        self.mongo_db_client = AsyncIOMotorClient(mongodbURI)
     
     def isValidRegex(self, pattern):
         try:
@@ -355,82 +350,90 @@ class QueryDatabase(commands.Cog):
         pattern: str | None = None,
         verbose: bool = False
     ):
-        # verify parameters
-        inputs = [exact_callsign, pattern]
-        provided = [x for x in inputs if x is not None]
-
-        if len(provided) != 1:
+        if (exact_callsign and pattern) or (not exact_callsign and not pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "You must either give the a callsign or a pattern and not both."
-                ),
+                description="You must provide either an exact callsign or a pattern, but not both.",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed)
-            return
+            return await interaction.response.send_message(embed=embed)
         
         if pattern is not None and not self.isValidRegex(pattern):
             embed = discord.Embed(
                 title="Failed",
-                description=(
-                    "Your regex is not valid. Could not compile."
-                ),
+                description="Your regex is not valid. Could not compile.",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed)
-            return
+            return await interaction.response.send_message(embed=embed)
 
         await interaction.response.defer()
-        collection = self.mongo_db_client[DATABASE_NAME]["users"]
 
-        if exact_callsign:
-            results = collection.find({
-                "pastCallsigns": {
-                    "$elemMatch": {
-                        "$regex": f"^{re.escape(exact_callsign)}$",
-                        "$options": "i"
-                    }
-                }
-            })
-        
-        if pattern:
-            # Parse the input for slashes and valid MongoDB flags (i, m, x, s)
-            core_pattern, flags = self.parse_regex_input(pattern)
-            regex_query = {"$regex": core_pattern}
+        # Define the pagination callback
+        async def fetch_page_callback(page: int, per_page: int) -> list:
+            params = {
+                "page": page,
+                "per_page": per_page
+            }
+            if exact_callsign: params["exact_callsign"] = exact_callsign
+            if pattern: params["pattern"] = pattern
+
+            api_url = f"http://{DATABASE_IP}:5011/api/v2/users/search"
             
-            valid_mongo_flags = set("imxs")
-            safe_flags = "".join(f for f in flags if f in valid_mongo_flags)
-            
-            if safe_flags:
-                regex_query["$options"] = safe_flags
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, params=params) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
 
-            results = collection.find({
-                "pastCallsigns": regex_query
-            }).max_time_ms(2000)
-
-        parsed_accounts = await results.to_list(length=500)
-        account_list = []
-        if parsed_accounts:
-            for document in parsed_accounts:
+            results = data.get("results", [])
+            formatted_items = []
+            for doc in results:
                 if verbose:
-                    account_list.append(f"**ACID**: {document['accountID']} | **Online**: {document['Online']} | **Current Aircraft**: {document['currentAircraft']} | **Current Callsign**: {document['currentCallsign']} | **Last Online**: {document['lastOnline']}")
+                    formatted_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')} | **Current Aircraft**: {doc.get('currentAircraft')} | **Current Callsign**: {doc.get('currentCallsign')} | **Last Online**: {doc.get('lastOnline')}")
                 else:
-                    account_list.append(f"**ACID**: {document['accountID']} | **Online**: {document['Online']}")
-        else:
+                    formatted_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')}")
+            return formatted_items
+
+        # Fetch the first page to get the total count
+        params = {"page": 1, "per_page": 10}
+        if exact_callsign: params["exact_callsign"] = exact_callsign
+        if pattern: params["pattern"] = pattern
+
+        api_url = f"http://{DATABASE_IP}:5011/api/v2/users/search"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, params=params) as resp:
+                if resp.status != 200:
+                    return await interaction.followup.send("Failed to contact the database API.")
+                data = await resp.json()
+
+        total_items = data.get("count", 0)
+
+        if total_items == 0:
             embed = discord.Embed(
                 title="No Matches",
-                description="No accounts were found with past callsigns matching the given.",
+                description="No accounts were found with past callsigns matching the given query.",
                 color=discord.Color.yellow()
             )
-            await interaction.followup.send(embed=embed)
-            return
-        
-        embed = PaginatedEmbed(
-            account_list,
-            title=f"Queried Acccount IDs",
-            description=f"{len(account_list)} accounts(s) for **{exact_callsign if exact_callsign else pattern}**"
+            return await interaction.followup.send(embed=embed)
+
+        # Format initial items
+        initial_items = []
+        for doc in data.get("results", []):
+            if verbose:
+                initial_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')} | **Current Aircraft**: {doc.get('currentAircraft')} | **Current Callsign**: {doc.get('currentCallsign')} | **Last Online**: {doc.get('lastOnline')}")
+            else:
+                initial_items.append(f"**ACID**: {doc.get('accountID')} | **Online**: {doc.get('Online')}")
+
+        search_term = exact_callsign if exact_callsign else pattern
+        embed = ServerPaginatedEmbed(
+            initial_items=initial_items,
+            total_items=total_items,
+            fetch_callback=fetch_page_callback,
+            title="Queried Account IDs",
+            description=f"{total_items} account(s) found for **{search_term}**",
+            items_per_page=10
         )
+        
         await interaction.followup.send(embed=embed.embed, view=embed)
 
     @database_query.command(name="account_report", description="Pull a full account report.")
